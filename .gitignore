@@ -1,0 +1,5 @@
+# Logs contiennent des donnees reelles de clients (device/user names, object IDs) - jamais en repo
+Logs/*.csv
+
+# Fichiers locaux Windows/PowerShell divers
+*.ps1~

@@ -74,6 +74,20 @@ function Resolve-WaveTargetType {
     }
 }
 
+function Resolve-WavePlatform {
+    param([string]$Raw)
+    if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
+    switch ($Raw.Trim().ToLowerInvariant()) {
+        { $_ -in @('windows', 'win', 'w') } { return 'Windows' }
+        { $_ -in @('android', 'a') } { return 'Android' }
+        { $_ -in @('ios', 'i') } { return 'iOS' }
+        { $_ -in @('linux', 'l') } { return 'Linux' }
+        { $_ -in @('macos', 'mac', 'osx', 'm') } { return 'macOS' }
+        { $_ -in @('all', 'tous', 'toutes', 't') } { return 'All' }
+        default { return $null }
+    }
+}
+
 function Confirm-WaveTenant {
     param(
         [Parameter(Mandatory)][string]$ExpectedTenantId

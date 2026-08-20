@@ -41,7 +41,8 @@
     Nom du deploiement (utilise dans le nom de chaque groupe de vague).
 
 .PARAMETER Platform
-    Filtre optionnel de plateforme : All, Windows, iOS, Android, macOS. Defaut : All.
+    Filtre optionnel de plateforme : All, Windows, iOS, Android, Linux, macOS. Defaut : All.
+    Si TargetType = Device et que ce parametre n'est pas fourni, le script le demande de maniere interactive.
 
 .EXAMPLE
     .\New-WaveGroups.ps1 -TenantId $tid -ClientId $cid -CertThumbprint $thumb -TargetType Device -DeploymentName "Win32AppX" -Platform Windows
@@ -63,7 +64,7 @@ param(
     [Parameter(Mandatory)]
     [string]$DeploymentName,
 
-    [ValidateSet('All', 'Windows', 'iOS', 'Android', 'macOS')]
+    [ValidateSet('All', 'Windows', 'iOS', 'Android', 'Linux', 'macOS')]
     [string]$Platform = 'All'
 )
 
@@ -80,6 +81,18 @@ while (-not $TargetType) {
     }
 }
 Write-Host "Type de cible retenu : $TargetType" -ForegroundColor Green
+
+if ($TargetType -eq 'Device' -and -not $PSBoundParameters.ContainsKey('Platform')) {
+    $Platform = $null
+    while (-not $Platform) {
+        $raw = Read-Host "OS cible - reponses acceptees : Windows / Android / iOS / Linux / macOS (ou 'All' pour ne pas filtrer)"
+        $Platform = Resolve-WavePlatform -Raw $raw
+        if (-not $Platform) {
+            Write-Host "Reponse invalide. Entre 'Windows', 'Android', 'iOS', 'Linux', 'macOS' ou 'All'." -ForegroundColor Red
+        }
+    }
+    Write-Host "OS retenu : $Platform" -ForegroundColor Green
+}
 
 [int]$waveCount = 0
 while ($waveCount -lt 1) {

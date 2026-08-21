@@ -1,88 +1,90 @@
+**English** | [Français](README.fr.md)
+
 # IntuneWaveBuilder
 
-Outil PowerShell (CLI + interface graphique) pour déployer des mises à jour ou des applications Intune **par vagues**, en créant automatiquement des groupes de sécurité Entra ID peuplés aléatoirement à partir des appareils ou utilisateurs réellement gérés par Intune.
+PowerShell tool (CLI + GUI) for rolling out Intune updates or applications **in waves**, by automatically creating Entra ID security groups randomly populated from devices or users actually managed by Intune.
 
-Chaque tenant client est isolé : une App Registration dédiée, authentifiée par certificat, avec des permissions Graph minimales.
+Each client tenant is isolated: a dedicated App Registration, certificate-authenticated, with minimal Graph permissions.
 
-## Pourquoi
+## Why
 
-Déployer une mise à jour ou une application à 100% du parc en une seule fois est risqué. IntuneWaveBuilder découpe la cible en plusieurs vagues (ex. 10% / 20% / 70%) et crée un groupe de sécurité Entra ID par vague, chacun assigné à une politique/appli Intune séparée — permettant de valider une vague avant de passer à la suivante.
+Deploying an update or application to 100% of a fleet in one shot is risky. IntuneWaveBuilder splits the target into several waves (e.g. 10% / 20% / 70%) and creates one Entra ID security group per wave, each assigned to a separate Intune policy/app — letting you validate one wave before moving to the next.
 
-## Fonctionnalités
+## Features
 
-- **Vagues sans doublon** : le pool d'appareils/utilisateurs éligibles est tiré une seule fois, réparti entre les vagues *sans remise* — aucune entité ne peut se retrouver dans deux vagues.
-- **Ciblage Device ou User**, avec filtre de plateforme (Windows / iOS / Android / Linux / macOS) en mode Device.
-- **Pool toujours restreint aux appareils gérés par Intune** (`managementState = managed`), jamais aux appareils simplement inscrits dans Entra ID.
-- **Confirmation du tenant** avant toute création : le nom, le domaine et le TenantId de l'organisation réellement connectée sont affichés et doivent être confirmés — protection contre un mauvais choix de client.
-- **Isolation par client** : chaque tenant a sa propre App Registration, son propre certificat, aucun partage entre clients.
-- **Log CSV par groupe** (membres ajoutés / échecs) pour audit.
-- **Interface graphique** (dark mode) en plus des scripts CLI, pilotant exactement la même logique.
+- **No-duplicate waves**: the pool of eligible devices/users is pulled once and split across waves *without replacement* — no entity can end up in two waves.
+- **Device or User targeting**, with a platform filter (Windows / iOS / Android / Linux / macOS) in Device mode.
+- **Pool always restricted to Intune-managed devices** (`managementState = managed`), never to devices merely registered in Entra ID.
+- **Tenant confirmation** before any creation: the display name, domain, and TenantId of the actually-connected organization are shown and must be confirmed — protection against picking the wrong client.
+- **Per-client isolation**: each tenant has its own App Registration and its own certificate, nothing shared between clients.
+- **Per-group CSV log** (members added / failures) for auditing.
+- **Graphical interface** (dark mode) in addition to the CLI scripts, driving the exact same logic.
 
 ## Architecture
 
 ```
-Bootstrap-TenantApp.ps1   CLI - bootstrap d'un nouveau client (App Registration + cert)
-New-WaveGroups.ps1        CLI - création des vagues pour un client déjà bootstrappé
-Show-WaveBuilderGui.ps1   GUI (WPF) - couvre les deux flux ci-dessus + registre clients + logs
-WaveGroups.Common.ps1     Logique partagée (appels Graph, aucune duplication CLI/GUI)
-Logs/                     CSV générés par vague (ignorés par git - données clients réelles)
+Bootstrap-TenantApp.ps1   CLI - bootstraps a new client (App Registration + certificate)
+New-WaveGroups.ps1        CLI - creates the waves for an already-bootstrapped client
+Show-WaveBuilderGui.ps1   GUI (WPF) - covers both flows above, plus client registry and logs
+WaveGroups.Common.ps1     Shared logic (Graph calls, no CLI/GUI duplication)
+Logs/                     Per-wave CSVs (git-ignored - contains real client data)
 ```
 
-`WaveGroups.Common.ps1` contient toute la logique métier (`Invoke-TenantBootstrap`, `Invoke-NewWaveGroups`, `Confirm-WaveTenant`, ...). Les scripts CLI et la GUI ne sont que deux façons différentes de piloter ces mêmes fonctions — aucune divergence de comportement entre les deux.
+`WaveGroups.Common.ps1` holds all the business logic (`Invoke-TenantBootstrap`, `Invoke-NewWaveGroups`, `Confirm-WaveTenant`, ...). The CLI scripts and the GUI are just two different front ends driving the same functions — no behavior drift between them.
 
-## Prérequis
+## Prerequisites
 
-- Windows PowerShell 5.1 ou PowerShell 7+ (les deux sont supportés et testés, y compris pour la GUI).
-- Module `Microsoft.Graph.Authentication` (installé automatiquement au premier lancement si absent).
-- Pour le **bootstrap** d'un client : un compte **Global Administrator**, ou **Application Administrator + Privileged Role Administrator**, dans le tenant cible.
-- Pour la **création de vagues** : aucun compte interactif requis — l'authentification se fait via le certificat créé au bootstrap.
+- Windows PowerShell 5.1 or PowerShell 7+ (both supported and tested, including the GUI).
+- `Microsoft.Graph.Authentication` module (auto-installed on first run if missing).
+- For **bootstrapping** a client: a **Global Administrator** account, or **Application Administrator + Privileged Role Administrator**, in the target tenant.
+- For **creating waves**: no interactive account needed — authentication uses the certificate created during bootstrap.
 
-## Démarrage rapide
+## Quick start
 
-### 1. Bootstrap d'un nouveau client (une seule fois par tenant)
+### 1. Bootstrap a new client (once per tenant)
 
 ```powershell
 .\Bootstrap-TenantApp.ps1 -ClientName "Contoso"
 ```
 
-Ouvre une connexion interactive (le compte doit avoir les droits ci-dessus), puis crée :
+Opens an interactive sign-in (the account needs the rights listed above), then creates:
 
-- une App Registration dédiée (`IntuneWaveBuilder-Contoso`) avec les permissions applicatives minimales :
+- a dedicated App Registration (`IntuneWaveBuilder-Contoso`) with minimal application permissions:
   - `DeviceManagementManagedDevices.Read.All`
   - `Device.Read.All`
   - `User.Read.All`
   - `Group.Create`
   - `GroupMember.ReadWrite.All`
-- un certificat auto-signé local (`Cert:\CurrentUser\My`, clé privée non exportable)
-- le Service Principal (Enterprise App) associé
-- le consentement admin pour les permissions ci-dessus
-- une entrée locale dans `%LOCALAPPDATA%\IntuneWaveBuilder\clients.json` (TenantId / ClientId / Thumbprint)
+- a local self-signed certificate (`Cert:\CurrentUser\My`, non-exportable private key)
+- the associated Service Principal (Enterprise App)
+- admin consent for the permissions above
+- a local entry in `%LOCALAPPDATA%\IntuneWaveBuilder\clients.json` (TenantId / ClientId / Thumbprint)
 
-### 2. Créer des vagues
+### 2. Create waves
 
 ```powershell
 .\New-WaveGroups.ps1 -TenantId '<tenant-id>' -ClientId '<client-id>' -CertThumbprint '<thumbprint>' `
     -TargetType Device -DeploymentName "Win32AppX" -Platform Windows
 ```
 
-Le script demande ensuite le nombre de vagues et le pourcentage de chacune, affiche le tenant réellement connecté pour confirmation, puis crée un groupe `ADSG_Intune_<Deploiement>_Wave<N>` (ou `AUSG_...` en mode User) par vague, peuplé aléatoirement.
+The script then asks for the number of waves and each wave's percentage, displays the actually-connected tenant for confirmation, then creates one `ADSG_Intune_<Deployment>_Wave<N>` group per wave (or `AUSG_...` in User mode), randomly populated.
 
-### 3. Ou : tout faire depuis l'interface graphique
+### 3. Or: do it all from the GUI
 
 ```powershell
 .\Show-WaveBuilderGui.ps1
 ```
 
-4 onglets : **Nouveau client (Bootstrap)**, **Créer des vagues**, **Registre clients** (gérer les clients déjà bootstrappés), **Logs** (parcourir les CSV générés). Les appels Graph s'exécutent en arrière-plan pour ne jamais geler l'interface.
+4 tabs: **Nouveau client (Bootstrap)**, **Créer des vagues**, **Registre clients** (manage already-bootstrapped clients), **Logs** (browse the generated CSVs). Graph calls run in the background so the UI never freezes.
 
-## Sécurité
+## Security
 
-- Chaque client a sa **propre** App Registration et son **propre** certificat — aucun credential partagé entre tenants.
-- Les permissions applicatives accordées sont **minimales** et listées explicitement dans `Bootstrap-TenantApp.ps1` / `Invoke-TenantBootstrap`.
-- Avant toute création de groupe, le tenant **réellement connecté** est affiché et doit être confirmé explicitement — protection contre un `TenantId`/`ClientId` copié-collé par erreur.
-- Le fichier `clients.json` (`%LOCALAPPDATA%\IntuneWaveBuilder\`) n'est qu'une **référence locale** (Tenant/Client/Thumbprint) : le supprimer ou retirer une entrée depuis l'onglet "Registre clients" de la GUI ne supprime **pas** l'App Registration ni le certificat côté tenant.
-- Les logs CSV (`Logs/`) contiennent des données réelles de clients (noms d'appareils/utilisateurs, ObjectId) et sont exclus du dépôt via `.gitignore`.
+- Each client has its **own** App Registration and its **own** certificate — no credential shared between tenants.
+- The granted application permissions are **minimal** and explicitly listed in `Bootstrap-TenantApp.ps1` / `Invoke-TenantBootstrap`.
+- Before any group creation, the **actually-connected** tenant is displayed and must be explicitly confirmed — protection against a copy-pasted `TenantId`/`ClientId` mistake.
+- The `clients.json` file (`%LOCALAPPDATA%\IntuneWaveBuilder\`) is only a **local reference** (Tenant/Client/Thumbprint): deleting it, or removing an entry from the GUI's "Registre clients" tab, does **not** delete the App Registration or the certificate on the tenant side.
+- CSV logs (`Logs/`) contain real client data (device/user names, ObjectId) and are excluded from the repo via `.gitignore`.
 
-## Compatibilité
+## Compatibility
 
-Testé sous **Windows PowerShell 5.1** et **PowerShell 7**, y compris l'interface graphique WPF (une différence de comportement de rendu entre .NET Framework et .NET a été identifiée et corrigée — voir l'historique des commits pour le détail).
+Tested on **Windows PowerShell 5.1** and **PowerShell 7**, including the WPF GUI (a .NET Framework vs .NET rendering-behavior difference was found and fixed — see the commit history for details).

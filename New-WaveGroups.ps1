@@ -24,6 +24,9 @@
     creation de groupe ou ajout de membre - protection contre un copier-coller de TenantId/ClientId
     errone qui pointerait vers le mauvais client.
 
+    La logique de recuperation du pool et de creation des groupes est partagee avec la GUI
+    (Show-WaveBuilderGui.ps1) via la fonction Invoke-NewWaveGroups de WaveGroups.Common.ps1.
+
 .PARAMETER TenantId
     Tenant cible (affiche par Bootstrap-TenantApp.ps1 a la fin de son execution).
 
@@ -127,139 +130,13 @@ try {
     exit 1
 }
 
-# --- 1. Recuperation des devices geres par Intune ---
-Write-Host "Recuperation des devices Intune-managed..." -ForegroundColor Cyan
-$selectFields = 'id,deviceName,azureADDeviceId,userId,userPrincipalName,operatingSystem,managementState'
-$managedDevices = Invoke-WaveGraphPaged -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$select=$selectFields"
-$managedDevices = $managedDevices | Where-Object { $_.managementState -eq 'managed' }
-
-if ($Platform -ne 'All') {
-    $managedDevices = $managedDevices | Where-Object { $_.operatingSystem -eq $Platform }
-}
-Write-Host "  $($managedDevices.Count) device(s) Intune-managed apres filtre plateforme." -ForegroundColor Green
-
-if ($managedDevices.Count -eq 0) { throw "Aucun device Intune-managed ne correspond aux criteres. Abandon." }
-
-# --- 2. Construction du pool selon TargetType (une seule fois, partage entre toutes les vagues) ---
-$candidatePool = [System.Collections.Generic.List[object]]::new()
-
-if ($TargetType -eq 'Device') {
-    Write-Host "Resolution des objets Entra ID correspondants (mapping deviceId -> objectId)..." -ForegroundColor Cyan
-    $aadDevices = Invoke-WaveGraphPaged -Uri "https://graph.microsoft.com/v1.0/devices?`$select=id,deviceId"
-    $deviceIdLookup = @{}
-    foreach ($d in $aadDevices) { $deviceIdLookup[$d.deviceId] = $d.id }
-
-    $skipped = 0
-    $seen = @{}
-    foreach ($md in $managedDevices) {
-        if (-not $md.azureADDeviceId) { $skipped++; continue }
-        $objectId = $deviceIdLookup[$md.azureADDeviceId]
-        if (-not $objectId) { $skipped++; continue }
-        if ($seen.ContainsKey($objectId)) { continue }
-        $seen[$objectId] = $true
-        $candidatePool.Add([pscustomobject]@{ Id = $objectId; Name = $md.deviceName })
-    }
-    if ($skipped -gt 0) { Write-Host "  $skipped device(s) Intune ignore(s) (pas d'objet Entra ID resolu)." -ForegroundColor DarkYellow }
-}
-else {
-    Write-Host "Resolution des proprietaires (userType Member, compte actif)..." -ForegroundColor Cyan
-    $userIds = $managedDevices | Where-Object { $_.userId } | Select-Object -ExpandProperty userId -Unique
-
-    $skipped = 0
-    foreach ($uid in $userIds) {
-        try {
-            $user = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users/$uid`?`$select=id,displayName,userPrincipalName,userType,accountEnabled"
-        } catch {
-            $skipped++; continue
-        }
-        if ($user.userType -ne 'Member' -or -not $user.accountEnabled) { $skipped++; continue }
-        $candidatePool.Add([pscustomobject]@{ Id = $user.id; Name = $user.userPrincipalName })
-    }
-    if ($skipped -gt 0) { Write-Host "  $skipped utilisateur(s) ignore(s) (guest / desactive / introuvable)." -ForegroundColor DarkYellow }
-}
-
-if ($candidatePool.Count -eq 0) { throw "Pool de selection vide apres filtrage. Abandon." }
-Write-Host "Pool final : $($candidatePool.Count) $TargetType(s) eligible(s)." -ForegroundColor Green
-
-# --- 3. Creation des groupes, une vague a la fois ---
-$prefix = if ($TargetType -eq 'Device') { 'ADSG' } else { 'AUSG' }
-$safeDeployment = ($DeploymentName -replace '[^A-Za-z0-9]+', '-').Trim('-')
 $logDir = Join-Path $PSScriptRoot 'Logs'
-if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-
-$summary = [System.Collections.Generic.List[object]]::new()
-
-$originalTotal = $candidatePool.Count
-$remainingPool = [System.Collections.Generic.List[object]]::new($candidatePool)
-
-for ($waveNumber = 1; $waveNumber -le $waveCount; $waveNumber++) {
-    $percentage = $wavePercentages[$waveNumber - 1]
-    Write-Host ""
-    Write-Host "-- Vague $waveNumber / $waveCount ($percentage%) --" -ForegroundColor Cyan
-
-    $sampleSize = [math]::Round($originalTotal * $percentage / 100.0)
-    if ($sampleSize -gt $remainingPool.Count) {
-        Write-Host "  Pool restant insuffisant ($($remainingPool.Count) disponible(s) pour $sampleSize demande(s)) -> selection plafonnee." -ForegroundColor DarkYellow
-        $sampleSize = $remainingPool.Count
-    }
-    if ($sampleSize -eq 0) {
-        Write-Host "  Aucun element disponible pour cette vague (pool epuise ou $percentage% de $originalTotal donne 0), vague ignoree." -ForegroundColor DarkYellow
-        continue
-    }
-    $selected = $remainingPool | Get-Random -Count $sampleSize
-    foreach ($item in $selected) { $remainingPool.Remove($item) | Out-Null }
-    Write-Host "  Tirage aleatoire (sans remise) : $sampleSize / $originalTotal selectionne(s). Pool restant apres cette vague : $($remainingPool.Count)." -ForegroundColor Green
-
-    $baseGroupName = "${prefix}_Intune_${safeDeployment}_Wave${waveNumber}"
-    $groupName = $baseGroupName
-    $existing = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$groupName'").value
-    if ($existing) {
-        $suffix = Get-Date -Format 'yyyyMMdd-HHmm'
-        $groupName = "${baseGroupName}_${suffix}"
-        Write-Host "  Un groupe '$baseGroupName' existe deja -> nouveau nom : $groupName" -ForegroundColor DarkYellow
-    }
-
-    Write-Host "  Creation du groupe '$groupName'..." -ForegroundColor Cyan
-    $mailNickname = ($groupName -replace '[^A-Za-z0-9]', '')
-    $groupBody = @{
-        displayName     = $groupName
-        mailEnabled     = $false
-        mailNickname    = $mailNickname
-        securityEnabled = $true
-        groupTypes      = @()
-        description     = "IntuneWaveBuilder - $TargetType - $percentage% - Wave $waveNumber - $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
-    } | ConvertTo-Json
-
-    $group = Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/groups' -Body $groupBody
-    Write-Host "  Groupe cree. Id: $($group.id)" -ForegroundColor Green
-
-    $logRows = [System.Collections.Generic.List[object]]::new()
-    $failures = 0
-    foreach ($member in $selected) {
-        $refBody = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$($member.Id)" } | ConvertTo-Json
-        try {
-            Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/groups/$($group.id)/members/`$ref" -Body $refBody | Out-Null
-            $logRows.Add([pscustomobject]@{ ObjectId = $member.Id; Name = $member.Name; Status = 'Added' })
-        } catch {
-            $failures++
-            $logRows.Add([pscustomobject]@{ ObjectId = $member.Id; Name = $member.Name; Status = "Failed: $($_.Exception.Message)" })
-        }
-    }
-    if ($failures -gt 0) { Write-Host "  $failures ajout(s) en echec (voir le log)." -ForegroundColor DarkYellow }
-
-    $logPath = Join-Path $logDir "$groupName.csv"
-    $logRows | Export-Csv -Path $logPath -NoTypeInformation -Encoding UTF8
-
-    $summary.Add([pscustomobject]@{
-        Wave        = $waveNumber
-        Percentage  = $percentage
-        GroupName   = $groupName
-        GroupId     = $group.id
-        MembersAdded = $logRows.Count - $failures
-        MembersTotal = $logRows.Count
-        Log         = $logPath
-    })
-}
+$summary = Invoke-NewWaveGroups `
+    -TargetType $TargetType `
+    -DeploymentName $DeploymentName `
+    -Platform $Platform `
+    -WavePercentages $wavePercentages `
+    -LogDir $logDir
 
 Disconnect-MgGraph | Out-Null
 

@@ -104,18 +104,15 @@ function Get-WaveOrganizationInfo {
     $primaryDomain = ($org.verifiedDomains | Where-Object { $_.isDefault }).name
     if (-not $primaryDomain) { $primaryDomain = ($org.verifiedDomains | Select-Object -First 1).name }
 
-    $info = [pscustomobject]@{
+    # Matches=$false is returned rather than thrown here so callers can display
+    # the actually-connected tenant's Name/Domain BEFORE aborting - the whole
+    # point of this check is to let the user recognize a wrong-tenant connection.
+    return [pscustomobject]@{
         Id            = $org.id
         DisplayName   = $org.displayName
         PrimaryDomain = $primaryDomain
         Matches       = ($org.id -eq $ExpectedTenantId)
     }
-
-    if (-not $info.Matches) {
-        throw "Le TenantId retourne par /organization ($($org.id)) ne correspond pas au TenantId fourni ($ExpectedTenantId). Abandon par securite."
-    }
-
-    return $info
 }
 
 function Confirm-WaveTenant {
@@ -131,6 +128,10 @@ function Confirm-WaveTenant {
     Write-Host "   Domaine      : $($info.PrimaryDomain)" -ForegroundColor Yellow
     Write-Host "   TenantId     : $($info.Id)" -ForegroundColor Yellow
     Write-Host "=====================================================" -ForegroundColor Yellow
+
+    if (-not $info.Matches) {
+        throw "Le TenantId retourne par /organization ($($info.Id)) ne correspond pas au TenantId fourni ($ExpectedTenantId). Abandon par securite."
+    }
 
     $answer = Read-Host "Confirmer la creation des groupes dans CE tenant ? (O/N)"
     if ($answer -notmatch '^[oOyY]') {
@@ -191,76 +192,82 @@ function Invoke-TenantBootstrap {
     $tenantId = $context.TenantId
     & $Log "Connecte au tenant $tenantId" 'Green'
 
-    & $Log "Resolution des permissions applicatives requises..." 'Cyan'
-    $appRoles = Get-WaveGraphAppRoleIds -PermissionNames $requiredPermissions
+    # Everything from here on holds a live Graph connection - wrap in try/finally so a
+    # failure partway through (cert ok but SP creation fails, a role consent POST fails,
+    # etc.) still disconnects instead of leaving the app-only session open.
+    try {
+        & $Log "Resolution des permissions applicatives requises..." 'Cyan'
+        $appRoles = Get-WaveGraphAppRoleIds -PermissionNames $requiredPermissions
 
-    & $Log "Generation du certificat local (Cert:\CurrentUser\My)..." 'Cyan'
-    $certSubject = "CN=IntuneWaveBuilder-$ClientName"
-    $cert = New-SelfSignedCertificate `
-        -Subject $certSubject `
-        -CertStoreLocation 'Cert:\CurrentUser\My' `
-        -KeyExportPolicy NonExportable `
-        -KeySpec Signature `
-        -KeyLength 2048 `
-        -HashAlgorithm SHA256 `
-        -NotAfter (Get-Date).AddYears($CertValidityYears)
+        & $Log "Generation du certificat local (Cert:\CurrentUser\My)..." 'Cyan'
+        $certSubject = "CN=IntuneWaveBuilder-$ClientName"
+        $cert = New-SelfSignedCertificate `
+            -Subject $certSubject `
+            -CertStoreLocation 'Cert:\CurrentUser\My' `
+            -KeyExportPolicy NonExportable `
+            -KeySpec Signature `
+            -KeyLength 2048 `
+            -HashAlgorithm SHA256 `
+            -NotAfter (Get-Date).AddYears($CertValidityYears)
 
-    $certBase64 = [Convert]::ToBase64String($cert.GetRawCertData())
-    & $Log "Certificat cree. Thumbprint: $($cert.Thumbprint)" 'Green'
+        $certBase64 = [Convert]::ToBase64String($cert.GetRawCertData())
+        & $Log "Certificat cree. Thumbprint: $($cert.Thumbprint)" 'Green'
 
-    $appDisplayName = "IntuneWaveBuilder-$ClientName"
-    & $Log "Creation de l'App Registration '$appDisplayName'..." 'Cyan'
+        $appDisplayName = "IntuneWaveBuilder-$ClientName"
+        & $Log "Creation de l'App Registration '$appDisplayName'..." 'Cyan'
 
-    $appBody = @{
-        displayName            = $appDisplayName
-        signInAudience          = 'AzureADMyOrg'
-        requiredResourceAccess = @(
-            @{
-                resourceAppId  = $script:GraphAppId
-                resourceAccess = @($appRoles.Roles | ForEach-Object { @{ id = $_.Id; type = 'Role' } })
+        $appBody = @{
+            displayName            = $appDisplayName
+            signInAudience          = 'AzureADMyOrg'
+            requiredResourceAccess = @(
+                @{
+                    resourceAppId  = $script:GraphAppId
+                    resourceAccess = @($appRoles.Roles | ForEach-Object { @{ id = $_.Id; type = 'Role' } })
+                }
+            )
+            keyCredentials = @(
+                @{
+                    type        = 'AsymmetricX509Cert'
+                    usage       = 'Verify'
+                    key         = $certBase64
+                    displayName = 'IntuneWaveBuilder'
+                }
+            )
+        } | ConvertTo-Json -Depth 10
+
+        $app = Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/applications' -Body $appBody
+        & $Log "App Registration creee. AppId (ClientId): $($app.appId)" 'Green'
+
+        $servicePrincipal = $null
+        $attempts = 0
+        while (-not $servicePrincipal -and $attempts -lt 6) {
+            $attempts++
+            try {
+                Start-Sleep -Seconds 5
+                $spBody = @{ appId = $app.appId } | ConvertTo-Json
+                $servicePrincipal = Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/servicePrincipals' -Body $spBody
+            } catch {
+                & $Log "  Replication AAD en cours, nouvelle tentative ($attempts/6)..." 'DarkYellow'
             }
-        )
-        keyCredentials = @(
-            @{
-                type        = 'AsymmetricX509Cert'
-                usage       = 'Verify'
-                key         = $certBase64
-                displayName = 'IntuneWaveBuilder'
-            }
-        )
-    } | ConvertTo-Json -Depth 10
-
-    $app = Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/applications' -Body $appBody
-    & $Log "App Registration creee. AppId (ClientId): $($app.appId)" 'Green'
-
-    $servicePrincipal = $null
-    $attempts = 0
-    while (-not $servicePrincipal -and $attempts -lt 6) {
-        $attempts++
-        try {
-            Start-Sleep -Seconds 5
-            $spBody = @{ appId = $app.appId } | ConvertTo-Json
-            $servicePrincipal = Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/servicePrincipals' -Body $spBody
-        } catch {
-            & $Log "  Replication AAD en cours, nouvelle tentative ($attempts/6)..." 'DarkYellow'
         }
-    }
-    if (-not $servicePrincipal) { throw "Echec de creation du Service Principal apres plusieurs tentatives." }
-    & $Log "Enterprise App (Service Principal) creee. Id: $($servicePrincipal.id)" 'Green'
+        if (-not $servicePrincipal) { throw "Echec de creation du Service Principal apres plusieurs tentatives." }
+        & $Log "Enterprise App (Service Principal) creee. Id: $($servicePrincipal.id)" 'Green'
 
-    & $Log "Octroi du consentement admin pour les permissions applicatives..." 'Cyan'
-    foreach ($role in $appRoles.Roles) {
-        $assignBody = @{
-            principalId = $servicePrincipal.id
-            resourceId  = $appRoles.GraphServicePrincipalId
-            appRoleId   = $role.Id
-        } | ConvertTo-Json
-        Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($servicePrincipal.id)/appRoleAssignedTo" -Body $assignBody | Out-Null
-        & $Log "  Consenti : $($role.Name)" 'Green'
-    }
+        & $Log "Octroi du consentement admin pour les permissions applicatives..." 'Cyan'
+        foreach ($role in $appRoles.Roles) {
+            $assignBody = @{
+                principalId = $servicePrincipal.id
+                resourceId  = $appRoles.GraphServicePrincipalId
+                appRoleId   = $role.Id
+            } | ConvertTo-Json
+            Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($servicePrincipal.id)/appRoleAssignedTo" -Body $assignBody | Out-Null
+            & $Log "  Consenti : $($role.Name)" 'Green'
+        }
 
-    Save-WaveClientEntry -ClientName $ClientName -TenantId $tenantId -ClientId $app.appId -CertThumbprint $cert.Thumbprint
-    Disconnect-MgGraph | Out-Null
+        Save-WaveClientEntry -ClientName $ClientName -TenantId $tenantId -ClientId $app.appId -CertThumbprint $cert.Thumbprint
+    } finally {
+        Disconnect-MgGraph | Out-Null
+    }
 
     return [pscustomobject]@{
         ClientName     = $ClientName

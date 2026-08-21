@@ -630,9 +630,24 @@ function Set-Busy {
     if ($Message) { $ctrl.StatusText.Text = $Message }
 }
 
-function Update-WaveTotal {
+function ConvertTo-WaveInt {
+    param($Value)
+    $parsed = 0
+    if ([int]::TryParse([string]$Value, [ref]$parsed)) { return $parsed }
+    return $null
+}
+
+function Get-WaveRowsTotal {
     $sum = 0
-    foreach ($row in $script:WaveRows) { $sum += [int]$row.Percentage }
+    foreach ($row in $script:WaveRows) {
+        $n = ConvertTo-WaveInt $row.Percentage
+        if ($null -ne $n) { $sum += $n }
+    }
+    return $sum
+}
+
+function Update-WaveTotal {
+    $sum = Get-WaveRowsTotal
     $ctrl.WaveTotalText.Text = "Total : $sum%"
     $brushConverter = [System.Windows.Media.BrushConverter]::new()
     $ctrl.WaveTotalText.Foreground = if ($sum -eq 100) { $brushConverter.ConvertFromString('#B4A860') }
@@ -665,8 +680,7 @@ function Update-LogsFileList {
 }
 
 function New-WaveRow {
-    $sum = 0
-    foreach ($row in $script:WaveRows) { $sum += [int]$row.Percentage }
+    $sum = Get-WaveRowsTotal
     $remaining = [Math]::Max(1, [Math]::Min(100, 100 - $sum))
     [pscustomobject]@{ Wave = $script:WaveRows.Count + 1; Percentage = $remaining }
 }
@@ -853,9 +867,15 @@ $ctrl.WaveRunButton.Add_Click({
         [System.Windows.MessageBox]::Show("Ajoute au moins une vague.", 'IntuneWaveBuilder', 'OK', 'Warning') | Out-Null
         return
     }
-    $percentages = @($script:WaveRows | ForEach-Object { [int]$_.Percentage })
-    if ($percentages | Where-Object { $_ -lt 1 -or $_ -gt 100 }) {
-        [System.Windows.MessageBox]::Show('Chaque pourcentage de vague doit etre entre 1 et 100.', 'IntuneWaveBuilder', 'OK', 'Warning') | Out-Null
+    $percentages = [System.Collections.Generic.List[int]]::new()
+    $invalidWaves = [System.Collections.Generic.List[int]]::new()
+    for ($i = 0; $i -lt $script:WaveRows.Count; $i++) {
+        $n = ConvertTo-WaveInt $script:WaveRows[$i].Percentage
+        if ($null -eq $n -or $n -lt 1 -or $n -gt 100) { $invalidWaves.Add($i + 1) }
+        else { $percentages.Add($n) }
+    }
+    if ($invalidWaves.Count -gt 0) {
+        [System.Windows.MessageBox]::Show("Pourcentage invalide pour la/les vague(s) : $($invalidWaves -join ', '). Chaque valeur doit etre un entier entre 1 et 100.", 'IntuneWaveBuilder', 'OK', 'Warning') | Out-Null
         return
     }
 
@@ -880,22 +900,27 @@ $ctrl.WaveRunButton.Add_Click({
         param($tenantId, $clientId, $certThumb, $targetType, $deploymentName, $platform, $percentages, $logDir)
 
         Connect-WaveGraphApp -TenantId $tenantId -ClientId $clientId -CertThumbprint $certThumb
-        $orgInfo = Get-WaveOrganizationInfo -ExpectedTenantId $tenantId
-        Write-WaveLogAsync -Message "Tenant connecte : $($orgInfo.DisplayName) ($($orgInfo.PrimaryDomain)) - $($orgInfo.Id)"
+        try {
+            $orgInfo = Get-WaveOrganizationInfo -ExpectedTenantId $tenantId
+            Write-WaveLogAsync -Message "Tenant connecte : $($orgInfo.DisplayName) ($($orgInfo.PrimaryDomain)) - $($orgInfo.Id)"
+            if (-not $orgInfo.Matches) {
+                throw "Le TenantId retourne par /organization ($($orgInfo.Id)) ne correspond pas au TenantId fourni ($tenantId). Abandon par securite."
+            }
 
-        $confirmed = $WaveWindow.Dispatcher.Invoke([Func[bool]]{
-            $r = [System.Windows.MessageBox]::Show(
-                "Tenant connecte :`nNom : $($orgInfo.DisplayName)`nDomaine : $($orgInfo.PrimaryDomain)`nTenantId : $($orgInfo.Id)`n`nConfirmer la creation des groupes dans CE tenant ?",
-                'Confirmation du tenant', 'YesNo', 'Warning')
-            return ($r -eq 'Yes')
-        })
-        if (-not $confirmed) { Disconnect-MgGraph | Out-Null; throw "Operation annulee par l'utilisateur (tenant non confirme)." }
+            $confirmed = $WaveWindow.Dispatcher.Invoke([Func[bool]]{
+                $r = [System.Windows.MessageBox]::Show(
+                    "Tenant connecte :`nNom : $($orgInfo.DisplayName)`nDomaine : $($orgInfo.PrimaryDomain)`nTenantId : $($orgInfo.Id)`n`nConfirmer la creation des groupes dans CE tenant ?",
+                    'Confirmation du tenant', 'YesNo', 'Warning')
+                return ($r -eq 'Yes')
+            })
+            if (-not $confirmed) { throw "Operation annulee par l'utilisateur (tenant non confirme)." }
 
-        $logSb = { param($Message, $Color) Write-WaveLogAsync -Message $Message }
-        $summary = Invoke-NewWaveGroups -TargetType $targetType -DeploymentName $deploymentName `
-            -Platform $platform -WavePercentages $percentages -LogDir $logDir -Log $logSb
-        Disconnect-MgGraph | Out-Null
-        $summary
+            $logSb = { param($Message, $Color) Write-WaveLogAsync -Message $Message }
+            Invoke-NewWaveGroups -TargetType $targetType -DeploymentName $deploymentName `
+                -Platform $platform -WavePercentages $percentages -LogDir $logDir -Log $logSb
+        } finally {
+            Disconnect-MgGraph | Out-Null
+        }
     } -OnDone {
         param($result, $err)
         Set-Busy $false 'Pret.'
@@ -977,11 +1002,13 @@ $window.Add_Loaded({
     $script:WaveRows.Add((New-WaveRow))
     Update-WaveTotal
 
+    Set-Busy $true 'Verification du module Microsoft.Graph.Authentication...'
     Start-WaveBackgroundTask -Work {
         Assert-WaveGraphAuthModule
         'ok'
     } -OnDone {
         param($result, $err)
+        Set-Busy $false 'Pret.'
         if ($err) { Write-GuiLog "Avertissement : module Microsoft.Graph.Authentication indisponible ($err)." }
     }
 })

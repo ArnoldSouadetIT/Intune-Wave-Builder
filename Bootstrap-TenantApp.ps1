@@ -15,6 +15,9 @@
       - Une entree locale de reference dans %LOCALAPPDATA%\IntuneWaveBuilder\clients.json
         (TenantId/ClientId/CertThumbprint a copier-coller dans New-WaveGroups.ps1).
 
+    La logique de bootstrap est partagee avec la GUI (Show-WaveBuilderGui.ps1) via la fonction
+    Invoke-TenantBootstrap de WaveGroups.Common.ps1.
+
 .PARAMETER ClientName
     Nom court et unique du client (utilise pour retrouver la config plus tard). Ex: "Contoso".
 
@@ -36,102 +39,19 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'WaveGroups.Common.ps1')
 
-$RequiredPermissions = @(
-    'DeviceManagementManagedDevices.Read.All'
-    'Device.Read.All'
-    'User.Read.All'
-    'Group.Create'
-    'GroupMember.ReadWrite.All'
-)
-
 Write-Host "== Bootstrap Intune Wave Builder pour '$ClientName' ==" -ForegroundColor Cyan
 Write-Host "Connexion interactive requise (Global Admin / Application Administrator + Privileged Role Administrator)." -ForegroundColor Yellow
 Connect-WaveGraphInteractive -Scopes @('Application.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All')
 
-$context = Get-MgContext
-$tenantId = $context.TenantId
-Write-Host "Connecte au tenant $tenantId" -ForegroundColor Green
-
-Write-Host "Resolution des permissions applicatives requises..." -ForegroundColor Cyan
-$appRoles = Get-WaveGraphAppRoleIds -PermissionNames $RequiredPermissions
-
-Write-Host "Generation du certificat local (Cert:\CurrentUser\My)..." -ForegroundColor Cyan
-$certSubject = "CN=IntuneWaveBuilder-$ClientName"
-$cert = New-SelfSignedCertificate `
-    -Subject $certSubject `
-    -CertStoreLocation 'Cert:\CurrentUser\My' `
-    -KeyExportPolicy NonExportable `
-    -KeySpec Signature `
-    -KeyLength 2048 `
-    -HashAlgorithm SHA256 `
-    -NotAfter (Get-Date).AddYears($CertValidityYears)
-
-$certBase64 = [Convert]::ToBase64String($cert.GetRawCertData())
-Write-Host "Certificat cree. Thumbprint: $($cert.Thumbprint)" -ForegroundColor Green
-
-$appDisplayName = "IntuneWaveBuilder-$ClientName"
-Write-Host "Creation de l'App Registration '$appDisplayName'..." -ForegroundColor Cyan
-
-$appBody = @{
-    displayName          = $appDisplayName
-    signInAudience        = 'AzureADMyOrg'
-    requiredResourceAccess = @(
-        @{
-            resourceAppId  = $script:GraphAppId
-            resourceAccess = @($appRoles.Roles | ForEach-Object { @{ id = $_.Id; type = 'Role' } })
-        }
-    )
-    keyCredentials = @(
-        @{
-            type        = 'AsymmetricX509Cert'
-            usage       = 'Verify'
-            key         = $certBase64
-            displayName = 'IntuneWaveBuilder'
-        }
-    )
-} | ConvertTo-Json -Depth 10
-
-$app = Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/applications' -Body $appBody
-Write-Host "App Registration creee. AppId (ClientId): $($app.appId)" -ForegroundColor Green
-
-# Laisse le temps a la replication AAD avant de creer le service principal
-$servicePrincipal = $null
-$attempts = 0
-while (-not $servicePrincipal -and $attempts -lt 6) {
-    $attempts++
-    try {
-        Start-Sleep -Seconds 5
-        $spBody = @{ appId = $app.appId } | ConvertTo-Json
-        $servicePrincipal = Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/servicePrincipals' -Body $spBody
-    } catch {
-        Write-Host "  Replication AAD en cours, nouvelle tentative ($attempts/6)..." -ForegroundColor DarkYellow
-    }
-}
-if (-not $servicePrincipal) { throw "Echec de creation du Service Principal apres plusieurs tentatives." }
-Write-Host "Enterprise App (Service Principal) creee. Id: $($servicePrincipal.id)" -ForegroundColor Green
-
-Write-Host "Octroi du consentement admin pour les permissions applicatives..." -ForegroundColor Cyan
-foreach ($role in $appRoles.Roles) {
-    $assignBody = @{
-        principalId = $servicePrincipal.id
-        resourceId  = $appRoles.GraphServicePrincipalId
-        appRoleId   = $role.Id
-    } | ConvertTo-Json
-    Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($servicePrincipal.id)/appRoleAssignedTo" -Body $assignBody | Out-Null
-    Write-Host "  Consenti : $($role.Name)" -ForegroundColor Green
-}
-
-Save-WaveClientEntry -ClientName $ClientName -TenantId $tenantId -ClientId $app.appId -CertThumbprint $cert.Thumbprint
-
-Disconnect-MgGraph | Out-Null
+$result = Invoke-TenantBootstrap -ClientName $ClientName -CertValidityYears $CertValidityYears
 
 Write-Host ""
 Write-Host "== Termine ==" -ForegroundColor Cyan
-Write-Host "Client        : $ClientName"
-Write-Host "TenantId      : $tenantId"
-Write-Host "ClientId      : $($app.appId)"
-Write-Host "Thumbprint    : $($cert.Thumbprint)"
+Write-Host "Client        : $($result.ClientName)"
+Write-Host "TenantId      : $($result.TenantId)"
+Write-Host "ClientId      : $($result.ClientId)"
+Write-Host "Thumbprint    : $($result.CertThumbprint)"
 Write-Host "Enregistre dans : $script:WaveRegistryPath (reference locale)"
 Write-Host ""
 Write-Host "Utilise ces valeurs avec New-WaveGroups.ps1 :" -ForegroundColor Green
-Write-Host "  -TenantId '$tenantId' -ClientId '$($app.appId)' -CertThumbprint '$($cert.Thumbprint)'" -ForegroundColor Green
+Write-Host "  -TenantId '$($result.TenantId)' -ClientId '$($result.ClientId)' -CertThumbprint '$($result.CertThumbprint)'" -ForegroundColor Green
